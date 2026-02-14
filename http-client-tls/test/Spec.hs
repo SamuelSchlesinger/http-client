@@ -1,30 +1,26 @@
-{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 import Test.Hspec
-import Network.Connection
 import Network.HTTP.Client
-import Network.HTTP.Client.TLS hiding (tlsManagerSettings)
+import Network.HTTP.Client.TLS
 import Network.HTTP.Types
 import Control.Monad (join)
 import Data.Default
 import qualified Network.TLS as TLS
+import qualified Network.TLS.Extra.Cipher as TLS
 
 main :: IO ()
 main = hspec $ do
-    let tlsSettings = def
-    -- Since the release of v2.0.0 of the `tls` package , the default value of
-    -- the `supportedExtendedMainSecret` parameter `is `RequireEMS`, this means
-    -- that all the connections to a server not supporting TLS1.2+EMS will fail.
-    -- The badssl.com service does not yet support TLS1.2+EMS connections, so
-    -- let's switch to the value `AllowEMS`, ie: TLS1.2 conenctions without EMS.
-#if MIN_VERSION_crypton_connection(0,4,0)
-            {settingClientSupported = def {TLS.supportedExtendedMainSecret = TLS.AllowEMS}}
-#endif
-
-    let tlsManagerSettings = mkManagerSettings tlsSettings Nothing
+    let params = (TLS.defaultParamsClient "" "")
+            { TLS.clientSupported = def
+                { TLS.supportedCiphers = TLS.ciphersuite_default
+                , TLS.supportedVersions = [TLS.TLS13, TLS.TLS12]
+                , TLS.supportedExtendedMainSecret = TLS.AllowEMS
+                }
+            }
+        settings = mkManagerSettings params
 
     it "make a TLS connection" $ do
-        manager <- newManager tlsManagerSettings
+        manager <- newManager settings
         withResponse "https://httpbin.org/status/418" manager $ \res ->
             responseStatus res `shouldBe` status418
 
@@ -45,36 +41,37 @@ main = hspec $ do
                 det == UnexpectedStatusCode
 
     it "BadSSL: expired" $ do
-        manager <- newManager tlsManagerSettings
+        manager <- newManager settings
         let action = withResponse "https://expired.badssl.com/" manager (const (return ()))
         action `shouldThrow` anyException
 
     it "BadSSL: self-signed" $ do
-        manager <- newManager tlsManagerSettings
+        manager <- newManager settings
         let action = withResponse "https://self-signed.badssl.com/" manager (const (return ()))
         action `shouldThrow` anyException
 
     it "BadSSL: wrong.host" $ do
-        manager <- newManager tlsManagerSettings
+        manager <- newManager settings
         let action = withResponse "https://wrong.host.badssl.com/" manager (const (return ()))
         action `shouldThrow` anyException
 
     it "BadSSL: we do have case-insensitivity though" $ do
-        manager <- newManager $ tlsManagerSettings
+        manager <- newManager settings
         withResponse "https://BADSSL.COM" manager $ \res ->
             responseStatus res `shouldBe` status200
 
-    -- https://github.com/snoyberg/http-client/issues/289
-    it "accepts TLS settings" $ do
-        let
-          tlsSettings' = tlsSettings
-            { settingDisableCertificateValidation = True
-            , settingDisableSession = False
-            , settingUseServerName = False
-            }
-          socketSettings = Nothing
-          managerSettings = mkManagerSettings tlsSettings' socketSettings
-        manager <- newTlsManagerWith managerSettings
+    it "accepts custom TLS settings (no cert validation)" $ do
+        let noValidateParams = (TLS.defaultParamsClient "" "")
+                { TLS.clientSupported = def
+                    { TLS.supportedCiphers = TLS.ciphersuite_default
+                    , TLS.supportedVersions = [TLS.TLS13, TLS.TLS12]
+                    }
+                , TLS.clientHooks = def
+                    { TLS.onServerCertificate = \_ _ _ _ -> return []
+                    }
+                }
+            noValidateSettings = mkManagerSettings noValidateParams
+        manager <- newTlsManagerWith noValidateSettings
         let url = "https://wrong.host.badssl.com"
         request <- parseRequest url
         response <- httpNoBody request manager

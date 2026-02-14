@@ -1,6 +1,6 @@
 name:                http-client-tls
 version:             0.3.6.4
-synopsis:            http-client backend using the connection package and tls library
+synopsis:            http-client backend using boring-tls (BoringSSL-backed TLS)
 description:         Hackage documentation generation is not reliable. For up to date documentation, please see: <https://www.stackage.org/package/http-client-tls>.
 homepage:            https://github.com/snoyberg/http-client
 license:             MIT
@@ -19,14 +19,13 @@ library
   build-depends:       base >= 4.10 && < 5
                      , data-default
                      , http-client >= 0.7.11
-                     , crypton-connection
                      , network
-                     , tls >= 2.1.2
+                     , boring-tls
+                     , boringssl
                      , bytestring
                      , case-insensitive
                      , transformers
                      , http-types
-                     , crypton
                      , memory
                      , exceptions
                      , containers
@@ -45,9 +44,8 @@ test-suite spec
                      , http-client
                      , http-client-tls
                      , http-types
-                     , crypton-connection
                      , data-default
-                     , tls
+                     , boring-tls
 
 benchmark benchmark
   main-is:             Bench.hs

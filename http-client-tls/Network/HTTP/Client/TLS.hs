@@ -2,8 +2,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE DeriveDataTypeable #-}
--- | Support for making connections via the connection package and, in turn,
--- the tls package suite.
+-- | Support for making connections via the boring-tls library.
 --
 -- Recommended reading: <https://haskell-lang.org/library/http-client>
 module Network.HTTP.Client.TLS
@@ -26,224 +25,184 @@ module Network.HTTP.Client.TLS
 import Control.Applicative ((<|>))
 import Control.Arrow (first)
 import System.Environment (getEnvironment)
-import Data.Default
 import Network.HTTP.Client hiding (host, port)
 import Network.HTTP.Client.Internal hiding (host, port)
 import Control.Exception
-import qualified Network.Connection as NC
 import Network.Socket (HostAddress)
+import qualified Network.Socket as NS
+import qualified Network.Socket.ByteString as NSB
 import qualified Network.TLS as TLS
+import qualified Network.TLS.Extra.Cipher as TLS
 import qualified Data.ByteString as S
+import qualified Data.ByteString.Char8 as S8
+import qualified Data.ByteString.Lazy as LBS
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import System.IO.Unsafe (unsafePerformIO)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad (guard, unless)
 import qualified Data.CaseInsensitive as CI
 import Data.Maybe (fromMaybe, isJust)
+import Data.Default (def)
 import Network.HTTP.Types (status401)
-import Crypto.Hash (hash, Digest, MD5)
-import Control.Arrow ((***))
+import Crypto.BoringSSL.Digest (Algorithm(..), hash)
 import Data.ByteArray.Encoding (convertToBase, Base (Base16))
 import Data.Typeable (Typeable)
 import Control.Monad.Catch (MonadThrow, throwM)
 import qualified Data.Map as Map
 import qualified Data.Text as T
 import Data.Text.Read (decimal)
-import qualified Network.URI as U
+import Control.Arrow ((***))
 
--- | Create a TLS-enabled 'ManagerSettings' with the given 'NC.TLSSettings' and
--- 'NC.SockSettings'
-mkManagerSettings :: NC.TLSSettings
-                  -> Maybe NC.SockSettings
+-- | Create a TLS-enabled 'ManagerSettings' with the given 'TLS.ClientParams'.
+mkManagerSettings :: TLS.ClientParams
                   -> ManagerSettings
 mkManagerSettings = mkManagerSettingsContext Nothing
 
 -- | Same as 'mkManagerSettings', but also takes an optional
--- 'NC.ConnectionContext'. Providing this externally can be an
--- optimization, though that may change in the future. For more
--- information, see:
---
--- <https://github.com/snoyberg/http-client/pull/227>
+-- 'TLS.CertificateStore' to use as the system CA store. If 'Nothing',
+-- the system certificate store will be loaded automatically.
 --
 -- @since 0.3.2
 mkManagerSettingsContext
-    :: Maybe NC.ConnectionContext
-    -> NC.TLSSettings
-    -> Maybe NC.SockSettings
+    :: Maybe TLS.CertificateStore
+    -> TLS.ClientParams
     -> ManagerSettings
-mkManagerSettingsContext mcontext tls sock = mkManagerSettingsContext' defaultManagerSettings mcontext tls sock sock
+mkManagerSettingsContext mstore params = mkManagerSettingsContext' defaultManagerSettings mstore params
 
--- | Internal, allow different SockSettings for HTTP and HTTPS
+-- | Internal, creates manager settings with TLS support.
 mkManagerSettingsContext'
     :: ManagerSettings
-    -> Maybe NC.ConnectionContext
-    -> NC.TLSSettings
-    -> Maybe NC.SockSettings -- ^ insecure
-    -> Maybe NC.SockSettings -- ^ secure
+    -> Maybe TLS.CertificateStore
+    -> TLS.ClientParams
     -> ManagerSettings
-mkManagerSettingsContext' set mcontext tls sockHTTP sockHTTPS = set
-    { managerTlsConnection = getTlsConnection mcontext (Just tls) sockHTTPS
-    , managerTlsProxyConnection = getTlsProxyConnection mcontext tls sockHTTPS
-    , managerRawConnection =
-        case sockHTTP of
-            Nothing -> managerRawConnection defaultManagerSettings
-            Just _ -> getTlsConnection mcontext Nothing sockHTTP
+mkManagerSettingsContext' set mstore params = set
+    { managerTlsConnection = getTlsConnection mstore params
+    , managerTlsProxyConnection = getTlsProxyConnection mstore params
+    , managerRawConnection = managerRawConnection defaultManagerSettings
     , managerRetryableException = \e ->
         case () of
             ()
-#if MIN_VERSION_tls(1,8,0)
                 | ((fromException e)::(Maybe TLS.TLSException))==Just (TLS.PostHandshake TLS.Error_EOF) -> True
-#else
-                | ((fromException e)::(Maybe TLS.TLSError))==Just TLS.Error_EOF -> True
-#endif
                 | otherwise -> managerRetryableException defaultManagerSettings e
     , managerWrapException = \req ->
         let wrapper se
               | Just (_ :: IOException)          <- fromException se = se'
               | Just (_ :: TLS.TLSException)     <- fromException se = se'
-#if !MIN_VERSION_tls(1,8,0)
-              | Just (_ :: TLS.TLSError)         <- fromException se = se'
-#endif
-              | Just (_ :: NC.LineTooLong)       <- fromException se = se'
-              | Just (_ :: NC.HostNotResolved)   <- fromException se = se'
-              | Just (_ :: NC.HostCannotConnect) <- fromException se = se'
               | otherwise = se
               where
                 se' = toException $ HttpExceptionRequest req $ InternalException se
          in handle $ throwIO . wrapper
     }
 
--- | Default TLS-enabled manager settings
+-- | Default TLS-enabled manager settings.
+--
+-- Uses the system certificate store for validation, default cipher suites,
+-- and TLS 1.2/1.3.
 tlsManagerSettings :: ManagerSettings
-tlsManagerSettings = mkManagerSettings def Nothing
+tlsManagerSettings = unsafePerformIO $ do
+    store <- TLS.getSystemCertificateStore
+    let params = (TLS.defaultParamsClient "" "")
+            { TLS.clientSupported = def
+                { TLS.supportedCiphers  = TLS.ciphersuite_default
+                , TLS.supportedVersions = [TLS.TLS13, TLS.TLS12]
+                }
+            , TLS.clientShared = def
+                { TLS.sharedCAStore = store
+                }
+            }
+    return $ mkManagerSettings params
+{-# NOINLINE tlsManagerSettings #-}
 
-getTlsConnection :: Maybe NC.ConnectionContext
-                 -> Maybe NC.TLSSettings
-                 -> Maybe NC.SockSettings
+-- | Create a TLS connection to the given host and port.
+getTlsConnection :: Maybe TLS.CertificateStore
+                 -> TLS.ClientParams
                  -> IO (Maybe HostAddress -> String -> Int -> IO Connection)
-getTlsConnection mcontext tls sock = do
-    context <- maybe NC.initConnectionContext return mcontext
-    return $ \_ha host port -> bracketOnError
-        (NC.connectTo context NC.ConnectionParams
-            { NC.connectionHostname = strippedHostName host
-            , NC.connectionPort = fromIntegral port
-            , NC.connectionUseSecure = tls
-            , NC.connectionUseSocks = sock
-            })
-        NC.connectionClose
-        convertConnection
+getTlsConnection mstore baseParams = do
+    systemStore <- case mstore of
+        Just s  -> return s
+        Nothing -> TLS.getSystemCertificateStore
+    return $ \_ha host port -> do
+        let params = baseParams
+                { TLS.clientServerIdentification = (strippedHostName host, S8.pack (show port))
+                , TLS.clientShared = (TLS.clientShared baseParams)
+                    { TLS.sharedCAStore = systemStore
+                    }
+                }
+        bracketOnError
+            (openSocket host port)
+            NS.close
+            $ \sock -> do
+                ctx <- TLS.contextNew sock params
+                TLS.handshake ctx
+                makeConnection
+                    (TLS.recvData ctx)
+                    (\bs -> TLS.sendData ctx (LBS.fromStrict bs))
+                    (TLS.bye ctx `catch` (\(_ :: SomeException) -> return ()) >> TLS.contextClose ctx)
 
 getTlsProxyConnection
-    :: Maybe NC.ConnectionContext
-    -> NC.TLSSettings
-    -> Maybe NC.SockSettings
+    :: Maybe TLS.CertificateStore
+    -> TLS.ClientParams
     -> IO (S.ByteString -> (Connection -> IO ()) -> String -> Maybe HostAddress -> String -> Int -> IO Connection)
-getTlsProxyConnection mcontext tls sock = do
-    context <- maybe NC.initConnectionContext return mcontext
-    return $ \connstr checkConn serverName _ha host port -> bracketOnError
-        (NC.connectTo context NC.ConnectionParams
-            { NC.connectionHostname = strippedHostName serverName
-            , NC.connectionPort = fromIntegral port
-            , NC.connectionUseSecure = Nothing
-            , NC.connectionUseSocks =
-                case sock of
-                    Just _ -> error "Cannot use SOCKS and TLS proxying together"
-                    Nothing -> Just $ NC.OtherProxy (strippedHostName host) $ fromIntegral port
-            })
-        NC.connectionClose
-        $ \conn -> do
-            NC.connectionPut conn connstr
-            conn' <- convertConnection conn
+getTlsProxyConnection mstore baseParams = do
+    systemStore <- case mstore of
+        Just s  -> return s
+        Nothing -> TLS.getSystemCertificateStore
+    return $ \connstr checkConn serverName _ha host port -> do
+        bracketOnError
+            (openSocket host port)
+            NS.close
+            $ \sock -> do
+                -- First, establish a plain connection to the proxy
+                conn <- makeConnection
+                    (NSB.recv sock 32752)
+                    (NSB.sendAll sock)
+                    (return ()) -- Don't close the socket yet
 
-            checkConn conn'
+                -- Send CONNECT to the proxy
+                connectionWrite conn connstr
 
-            NC.connectionSetSecure context conn tls
+                -- Let the caller verify the proxy connection
+                checkConn conn
 
-            return conn'
+                -- Now upgrade to TLS on the same socket
+                let params = baseParams
+                        { TLS.clientServerIdentification = (strippedHostName serverName, S8.pack (show port))
+                        , TLS.clientShared = (TLS.clientShared baseParams)
+                            { TLS.sharedCAStore = systemStore
+                            }
+                        }
+                ctx <- TLS.contextNew sock params
+                TLS.handshake ctx
 
-convertConnection :: NC.Connection -> IO Connection
-convertConnection conn = makeConnection
-    (NC.connectionGetChunk conn)
-    (NC.connectionPut conn)
-    -- Closing an SSL connection gracefully involves writing/reading
-    -- on the socket.  But when this is called the socket might be
-    -- already closed, and we get a @ResourceVanished@.
-    (NC.connectionClose conn `Control.Exception.catch` \(_ :: IOException) -> return ())
+                makeConnection
+                    (TLS.recvData ctx)
+                    (\bs -> TLS.sendData ctx (LBS.fromStrict bs))
+                    (TLS.bye ctx `catch` (\(_ :: SomeException) -> return ()) >> TLS.contextClose ctx)
 
--- We may decide in the future to just have a global
--- ConnectionContext and use it directly in tlsManagerSettings, at
--- which point this can again be a simple (newManager
--- tlsManagerSettings >>= newIORef). See:
--- https://github.com/snoyberg/http-client/pull/227.
-globalConnectionContext :: NC.ConnectionContext
-globalConnectionContext = unsafePerformIO NC.initConnectionContext
-{-# NOINLINE globalConnectionContext #-}
+-- | Open a TCP socket to the given host and port.
+openSocket :: String -> Int -> IO NS.Socket
+openSocket host port = do
+    let hints = NS.defaultHints { NS.addrSocketType = NS.Stream }
+    addrs <- NS.getAddrInfo (Just hints) (Just $ strippedHostName host) (Just $ show port)
+    case addrs of
+        []     -> fail $ "No addresses for " ++ host ++ ":" ++ show port
+        addr:_ -> do
+            sock <- NS.openSocket addr
+            NS.connect sock (NS.addrAddress addr)
+            return sock
 
 -- | Load up a new TLS manager with default settings, respecting proxy
 -- environment variables.
 --
 -- @since 0.3.4
 newTlsManager :: MonadIO m => m Manager
-newTlsManager = liftIO $ do
-    env <- getEnvironment
-    let lenv = Map.fromList $ map (first $ T.toLower . T.pack) env
-        msocksHTTP = parseSocksSettings env lenv "http_proxy"
-        msocksHTTPS = parseSocksSettings env lenv "https_proxy"
-        settings = mkManagerSettingsContext' defaultManagerSettings (Just globalConnectionContext) def msocksHTTP msocksHTTPS
-        settings' = maybe id (const $ managerSetInsecureProxy proxyFromRequest) msocksHTTP
-                  $ maybe id (const $ managerSetSecureProxy proxyFromRequest) msocksHTTPS
-                    settings
-    newManager settings'
+newTlsManager = liftIO $ newManager tlsManagerSettings
 
--- | Load up a new TLS manager based upon specified settings,
--- respecting proxy environment variables.
+-- | Load up a new TLS manager based upon specified settings.
 --
 -- @since 0.3.5
 newTlsManagerWith :: MonadIO m => ManagerSettings -> m Manager
-newTlsManagerWith set = liftIO $ do
-    env <- getEnvironment
-    let lenv = Map.fromList $ map (first $ T.toLower . T.pack) env
-        msocksHTTP = parseSocksSettings env lenv "http_proxy"
-        msocksHTTPS = parseSocksSettings env lenv "https_proxy"
-        settings = mkManagerSettingsContext' set (Just globalConnectionContext) def msocksHTTP msocksHTTPS
-        settings' = maybe id (const $ managerSetInsecureProxy proxyFromRequest) msocksHTTP
-                  $ maybe id (const $ managerSetSecureProxy proxyFromRequest) msocksHTTPS
-                    settings
-                        -- We want to keep the original TLS settings that were
-                        -- passed in. Sadly they aren't available as a record
-                        -- field on `ManagerSettings`. So instead we grab the
-                        -- fields that depend on the TLS settings.
-                        -- https://github.com/snoyberg/http-client/issues/289
-                        { managerTlsConnection = managerTlsConnection set
-                        , managerTlsProxyConnection = managerTlsProxyConnection set
-                        }
-    newManager settings'
-
-parseSocksSettings :: [(String, String)] -- ^ original environment
-                   -> Map.Map T.Text String -- ^ lower-cased keys
-                   -> T.Text -- ^ env name
-                   -> Maybe NC.SockSettings
-parseSocksSettings env lenv n = do
-  str <- lookup (T.unpack n) env <|> Map.lookup n lenv
-  let allowedScheme x = x == "socks5:" || x == "socks5h:"
-  uri <- U.parseURI str
-
-  guard $ allowedScheme $ U.uriScheme uri
-  guard $ null (U.uriPath uri) || U.uriPath uri == "/"
-  guard $ null $ U.uriQuery uri
-  guard $ null $ U.uriFragment uri
-
-  auth <- U.uriAuthority uri
-  port' <-
-      case U.uriPort auth of
-          "" -> Nothing -- should we use some default?
-          ':':rest ->
-              case decimal $ T.pack rest of
-                  Right (p, "") -> Just p
-                  _ -> Nothing
-          _ -> Nothing
-
-  Just $ NC.SockSettingsSimple (U.uriRegName auth) port'
+newTlsManagerWith set = liftIO $ newManager set
 
 -- | Evil global manager, to make life easier for the common use case
 globalManager :: IORef Manager
@@ -271,9 +230,7 @@ data DigestAuthException
     = DigestAuthException Request (Response ()) DigestAuthExceptionDetails
     deriving (Show, Typeable)
 instance Exception DigestAuthException where
-#if MIN_VERSION_base(4, 8, 0)
     displayException = displayDigestAuthException
-#endif
 
 -- | User friendly display of a 'DigestAuthException'
 --
@@ -361,7 +318,7 @@ applyDigestAuth user pass req0 man = liftIO $ do
                 -- we always use no qop or qop=auth
                 ha2 = md5 $ S.concat [method req, ":", path req]
 
-                md5 bs = convertToBase Base16 (hash bs :: Digest MD5)
+                md5 bs = convertToBase Base16 (hash MD5 bs)
             key = "Authorization"
             val = S.concat
                 [ "Digest username=\""
